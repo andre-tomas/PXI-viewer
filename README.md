@@ -117,6 +117,37 @@ found), sets Mono8, turns auto exposure/gain off and negotiates the GigE packet 
     camera returns to the live-view mode at full frame rate.
   - **Dump All Camera Features to Console**: prints every GenICam feature, for finding
     feature names on other firmware.
+- **Delay Scan:** steps the hardware trigger delay to find or map the timing.
+  - **Start / End / Step (µs):** the delays are start, start ± step, … towards end (a scan
+    can also run downwards). The end is included when it lies on the step grid. The camera
+    rounds to whole µs; the summary line shows the steps and the total.
+  - **Per step:** either a **number of frames**, or a **time (s)** with whatever frames
+    arrive in that time.
+  - **Settle time (s)** (default 0.5): after each delay change, frames arriving within
+    this time are discarded, since they may have been exposed with the previous delay.
+    The time per step counts from the end of the settle time.
+  - **Start Delay Scan** always uses the hardware trigger (Line1) with the debounce time,
+    save location, base filename and output formats of the Acquisition tab.
+    **Stop Delay Scan** ends it early. The progress bar and status line show the step,
+    the delay and the frames so far. Afterwards the delay goes back to the value on the
+    Acquisition tab. A delay typed during a scan applies only after it.
+  - Output: one run folder with one subfolder per step, so the PXI-viewer lists every
+    delay as its own run:
+
+    ```
+    <folder>/YY-MM-DD/<base><N>/
+        scan_log.csv                      settings, one row per step, end status
+        step001_delay0us/<base><N>_step001_delay0us_<timestamp>_trigger000001.h5
+        step002_delay10us/…
+        step003_delay12p5us/…             (12.5 µs; '.' becomes 'p')
+    ```
+
+    `scan_log.csv` (lines starting with `#` are comments: settings, end status) has the
+    columns `step, delay_set_us, delay_camera_us, frames, start_utc, end_utc, status,
+    folder`, with status `complete`, `stopped` or `error`. Each frame also records
+    `scan_step`, `scan_n_steps` and `scan_delay_set_us`, and `trigger_delay_us` is the
+    delay the camera actually used. Frame numbers (`trigger_index`) count through the
+    whole scan.
 
 ### Output files
 

@@ -60,6 +60,13 @@ v13 -> v14:
     switches back to Off (free-run), the camera re-applies the stored
     AcquisitionFrameRateAbs value. Now explicitly set to
     AcquisitionFrameRateLimit (camera maximum) on every stop.
+v14 -> v15:
+  - Delay scan (own tab): steps the hardware trigger delay from a start to an
+    end value and records a fixed number of frames, or a fixed time, per step.
+    Each step goes to its own subfolder (stepNNN_delay<X>us) of the run, so
+    the PXI-viewer lists every delay as a run; scan_log.csv in the run folder
+    lists the steps. Frames arriving within the settle time after a delay
+    change are discarded.
 v12 -> v13:
   - TriggerSource now tries SyncIn1 before Line1: on Mako G-032B the
     physical trigger input routes through SyncIn1, not Line1.
@@ -88,6 +95,8 @@ import cv2
 import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import csv
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -175,6 +184,31 @@ def next_run_number(folder: str, base: str) -> int:
     return max(numbers, default=0) + 1
 
 
+def scan_delays(start: float, end: float, step: float, max_steps: int = 10000) -> list:
+    """Delays of a scan from start towards end in steps of |step| (µs).
+
+    The direction follows start -> end, so a scan can also run downwards. The end
+    is included when it lies on the step grid; otherwise the last delay is the last
+    grid point before it. Raises ValueError for a step <= 0, a negative delay or
+    more than max_steps steps.
+    """
+    step = abs(step)
+    if step <= 0:
+        raise ValueError("step must be > 0")
+    if min(start, end) < 0:
+        raise ValueError("delays must be >= 0")
+    n = int(math.floor(abs(end - start) / step + 1e-9)) + 1
+    if n > max_steps:
+        raise ValueError(f"{n} steps; at most {max_steps}")
+    sign = 1.0 if end >= start else -1.0
+    return [round(start + sign * i * step, 6) for i in range(n)]
+
+
+def delay_label(delay: float) -> str:
+    """Delay as a file-name part: 120 -> '120us', 12.5 -> '12p5us'."""
+    return f"{delay:g}".replace(".", "p") + "us"
+
+
 # ------------------------------------------------------------------------------
 class MakoCameraGUI:
     TRIGGER_MODES = ["Software (manual button)", "Hardware Line1 (GPIO)"]
@@ -235,6 +269,17 @@ class MakoCameraGUI:
         self.save_png_var = tk.BooleanVar(value=True)
         self.save_h5_var = tk.BooleanVar(value=True)
 
+        # Delay scan (hardware trigger)
+        self.scan_start_us = tk.DoubleVar(value=0.0)
+        self.scan_end_us = tk.DoubleVar(value=100.0)
+        self.scan_step_us = tk.DoubleVar(value=10.0)
+        self.scan_mode = tk.StringVar(value="frames")     # "frames" or "seconds" per step
+        self.scan_frames = tk.IntVar(value=100)
+        self.scan_seconds = tk.DoubleVar(value=10.0)
+        self.scan_settle_s = tk.DoubleVar(value=0.5)
+        self._scan = None                       # state dict while a scan runs
+        self._scan_lock = threading.Lock()      # shared with the frame handler thread
+
         self.exp_var = tk.DoubleVar(value=1000)
         self.gain_var = tk.DoubleVar(value=0.0)
         self.gamma_var = tk.DoubleVar(value=1.0)
@@ -254,6 +299,7 @@ class MakoCameraGUI:
         self._build_live_tab()
         self._build_settings_tab()
         self._build_acquisition_tab()
+        self._build_scan_tab()
 
         if not PIL_AVAILABLE:
             messagebox.showwarning("Missing Library", "Install Pillow for live preview")
@@ -436,6 +482,67 @@ class MakoCameraGUI:
         ttk.Label(diag, text="Use this to find correct feature names for your firmware version.",
                   foreground="gray").pack(anchor=tk.W, pady=(2, 0))
 
+    def _build_scan_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text=" Delay Scan ")
+
+        rng = ttk.LabelFrame(tab, text="Trigger delay range", padding=12)
+        rng.pack(fill=tk.X, padx=15, pady=(15, 5))
+        for col, (label, var) in enumerate((("Start (µs):", self.scan_start_us),
+                                            ("End (µs):", self.scan_end_us),
+                                            ("Step (µs):", self.scan_step_us))):
+            ttk.Label(rng, text=label).grid(row=0, column=2 * col, sticky=tk.W, padx=(0 if col == 0 else 15, 4))
+            ttk.Spinbox(rng, from_=0, to=1000000, increment=1, width=10,
+                        textvariable=var).grid(row=0, column=2 * col + 1, sticky=tk.W)
+        ttk.Label(rng, text="The scan runs from start towards end (also downwards). The end is "
+                            "included when it lies on the step grid. The camera rounds the delay "
+                            "to whole µs.", foreground="gray", wraplength=900,
+                  justify=tk.LEFT).grid(row=1, column=0, columnspan=6, sticky=tk.W, pady=(6, 0))
+
+        per = ttk.LabelFrame(tab, text="Per step", padding=12)
+        per.pack(fill=tk.X, padx=15, pady=5)
+        ttk.Radiobutton(per, text="Number of frames:", value="frames",
+                        variable=self.scan_mode).grid(row=0, column=0, sticky=tk.W)
+        ttk.Spinbox(per, from_=1, to=1000000, increment=10, width=10,
+                    textvariable=self.scan_frames).grid(row=0, column=1, sticky=tk.W, padx=8)
+        ttk.Radiobutton(per, text="Time (s):", value="seconds",
+                        variable=self.scan_mode).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Spinbox(per, from_=0.1, to=86400, increment=1, width=10,
+                    textvariable=self.scan_seconds).grid(row=1, column=1, sticky=tk.W, padx=8, pady=(6, 0))
+        ttk.Label(per, text="Settle time after each delay change (s):").grid(
+            row=2, column=0, sticky=tk.W, pady=(10, 0))
+        ttk.Spinbox(per, from_=0, to=60, increment=0.1, width=10,
+                    textvariable=self.scan_settle_s).grid(row=2, column=1, sticky=tk.W, padx=8, pady=(10, 0))
+        ttk.Label(per, text="Frames arriving within the settle time may still have been "
+                            "exposed with the previous delay and are discarded. Time per step "
+                            "is counted after the settle time.", foreground="gray",
+                  wraplength=900, justify=tk.LEFT).grid(row=3, column=0, columnspan=3,
+                                                        sticky=tk.W, pady=(4, 0))
+
+        run = ttk.LabelFrame(tab, text="Scan", padding=12)
+        run.pack(fill=tk.X, padx=15, pady=5)
+        self.scan_summary = ttk.Label(run, text="")
+        self.scan_summary.pack(anchor=tk.W)
+        self.scan_btn = ttk.Button(run, text="Start Delay Scan",
+                                   command=self.toggle_delay_scan, state="disabled")
+        self.scan_btn.pack(anchor=tk.W, pady=(8, 4))
+        self.scan_progress = ttk.Progressbar(run, mode="determinate", maximum=1.0)
+        self.scan_progress.pack(fill=tk.X, pady=4)
+        self.scan_status = ttk.Label(run, text="Not running")
+        self.scan_status.pack(anchor=tk.W)
+        ttk.Label(run, text="Uses the hardware trigger (Line1) with the debounce time, save "
+                            "location, base filename and output formats of the Acquisition tab. "
+                            "Saved to <folder>/YY-MM-DD/<base filename><run number>/"
+                            "stepNNN_delay<X>us/, one subfolder per step, with scan_log.csv in "
+                            "the run folder. Afterwards the trigger delay goes back to the value "
+                            "on the Acquisition tab.", foreground="gray", wraplength=900,
+                  justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
+
+        for var in (self.scan_start_us, self.scan_end_us, self.scan_step_us, self.scan_mode,
+                    self.scan_frames, self.scan_seconds, self.scan_settle_s):
+            var.trace_add("write", self._update_scan_summary)
+        self._update_scan_summary()
+
     # --------------------------------------------------------------------------
     # Streaming
     # --------------------------------------------------------------------------
@@ -489,6 +596,7 @@ class MakoCameraGUI:
 
                     self.root.after(0, lambda: self.connect_btn.config(text="Stop Streaming"))
                     self.root.after(0, lambda: self.acq_btn.config(state="normal"))
+                    self.root.after(0, lambda: self.scan_btn.config(state="normal"))
                     self.root.after(0, lambda: self.status.config(text="Streaming…"))
 
                     def frame_handler(cam, stream, frame):
@@ -504,7 +612,10 @@ class MakoCameraGUI:
                                 img = img.astype(np.uint8)
 
                             # --- Acquisition handling ---
-                            if self.acquiring:
+                            if self.acquiring and self._scan is not None:
+                                # Delay scan: hardware trigger, saved per step
+                                self._scan_frame(img, frame)
+                            elif self.acquiring:
                                 # Hardware trigger mode: each frame is a trigger.
                                 # Discard frames that arrived within the first
                                 # HW_ARM_DISCARD_S seconds after arming — these
@@ -565,11 +676,18 @@ class MakoCameraGUI:
             self._stop_acquisition()
             self.root.after(0, lambda: self.connect_btn.config(text="Connect & Start Streaming"))
             self.root.after(0, lambda: self.acq_btn.config(state="disabled"))
+            self.root.after(0, lambda: self.scan_btn.config(state="disabled"))
 
     # --------------------------------------------------------------------------
     # Hardware trigger: each frame is one trigger
     # --------------------------------------------------------------------------
-    def _save_hardware_trigger_frame(self, img: np.ndarray, raw_frame):
+    def _save_hardware_trigger_frame(self, img: np.ndarray, raw_frame, folder=None,
+                                     png_dir=None, delay_us=None, extra=None, prefix=None):
+        """Save one hardware-triggered frame. folder/png_dir/prefix default to the
+        current run; delay_us to the delay the camera uses; extra adds attributes."""
+        folder = self._run_dir if folder is None else folder
+        png_dir = self._png_dir if png_dir is None else png_dir
+        prefix = self._run_name if prefix is None else prefix
         self.trigger_index += 1
         self.total_frames_saved += 1
         self.root.after(0, self._update_stats)
@@ -590,21 +708,23 @@ class MakoCameraGUI:
             height=img.shape[0],
             pixel_format="Mono8",
             trigger_mode="hardware",
-            trigger_delay_us=self._delay_value,
+            trigger_delay_us=self._delay_value if delay_us is None else delay_us,
         )
+        if extra:
+            meta.update(extra)
 
         # PNG
         if self.save_png_var.get():
             fname = (f"trigger{self.trigger_index:06d}"
                      f"_frame0000_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.png")
-            path = os.path.join(self._png_dir, fname)
+            path = os.path.join(png_dir, fname)
             threading.Thread(target=_save_png, args=(img, path), daemon=True).start()
 
         # HDF5 (one file per trigger)
         if self.save_h5_var.get():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            h5_filename = f"{self._run_name}_{timestamp}_trigger{self.trigger_index:06d}.h5"
-            h5_path = os.path.join(self._run_dir, h5_filename)
+            h5_filename = f"{prefix}_{timestamp}_trigger{self.trigger_index:06d}.h5"
+            h5_path = os.path.join(folder, h5_filename)
             self._executor.submit(
                 save_trigger_h5,
                 h5_path,
@@ -712,23 +832,32 @@ class MakoCameraGUI:
         else:
             self._start_acquisition()
 
-    def _start_acquisition(self):
-        # One subfolder per day (YY-MM-DD) inside the chosen folder, and in it
-        # one folder per run: <day>/<base><N>/ holds that run's H5 files and PNGs
+    def _new_run_folder(self):
+        """Create the next run folder and make it the current run.
+
+        One subfolder per day (YY-MM-DD) inside the chosen folder, and in it one
+        folder per run: <day>/<base><N>/ holds that run's H5 files and PNGs.
+        Returns the folder, or None (after an error dialog) if it cannot be made.
+        """
         day_folder = os.path.join(self.save_folder.get(), datetime.now().strftime("%y-%m-%d"))
         base = self.base_filename.get()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
         try:
             os.makedirs(day_folder, exist_ok=True)
             # Runs are numbered within the day: <base>1, <base>2, ...
-            self._run_name = f"{base}{next_run_number(day_folder, base)}"
-            folder = os.path.join(day_folder, self._run_name)
+            run_name = f"{base}{next_run_number(day_folder, base)}"
+            folder = os.path.join(day_folder, run_name)
             os.makedirs(folder, exist_ok=True)
         except Exception as e:
             messagebox.showerror("Error", f"Cannot create folder:\n{e}")
+            return None
+        self._run_name, self._run_dir = run_name, folder
+        return folder
+
+    def _start_acquisition(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = self._new_run_folder()
+        if folder is None:
             return
-        self._run_dir = folder
 
         # PNG subfolder
         self._png_dir = os.path.join(folder, f"{self._run_name}_{ts}_frames")
@@ -744,6 +873,7 @@ class MakoCameraGUI:
 
         self.acquiring = True
         self.acq_btn.config(text="Stop Acquisition")
+        self.scan_btn.config(state="disabled")
 
         if "Software" in self.trigger_mode_var.get():
             self.sw_trigger_btn.config(state="normal")
@@ -760,9 +890,15 @@ class MakoCameraGUI:
         self._update_stats()
 
     def _stop_acquisition(self):
+        if self._scan is not None:
+            self._finish_delay_scan("stopped")   # ends the scan, then comes back here
+            return
         self.acquiring = False
         self._sw_trigger_pending = False
         self.acq_btn.config(text="Start Acquisition")
+        state = "normal" if self.streaming else "disabled"
+        self.acq_btn.config(state=state)
+        self.scan_btn.config(state=state)
         self.sw_trigger_btn.config(state="disabled")
         self.status.config(text=f"Stopped. {self.total_frames_saved} frames saved.")
         # Back to the live-view mode: free run, or the hardware trigger if
@@ -824,17 +960,24 @@ class MakoCameraGUI:
             return   # half-typed value
         if not (self.cam and self.streaming):
             return   # applied with the hardware trigger configuration
+        if self._scan is not None:
+            self.status.config(text="Delay scan running: the typed trigger delay applies "
+                                    "after the scan")
+            return
         self._send_trigger_delay(delay)
 
     def _send_trigger_delay(self, delay):
-        """Set TriggerDelayAbs and remember the value the camera uses (it rounds to 1 µs)."""
+        """Set TriggerDelayAbs and remember the value the camera uses (it rounds to 1 µs).
+        Returns that value, or None if the camera refused it."""
         try:
             f = self.cam.get_feature_by_name("TriggerDelayAbs")
             f.set(max(delay, 0.0))
             self._delay_value = float(f.get())
             print(f"TriggerDelayAbs set to {self._delay_value} us")
+            return self._delay_value
         except Exception as e:
             print(f"TriggerDelayAbs warning: {e}")
+            return None
 
     def _configure_camera_trigger(self, hardware=None):
         """Set camera trigger source based on GUI selection.
@@ -920,6 +1063,242 @@ class MakoCameraGUI:
                     pass
         except Exception as e:
             print("Trigger config warning:", e)
+
+    # --------------------------------------------------------------------------
+    # Delay scan: step the hardware trigger delay, N frames or T seconds per step
+    # --------------------------------------------------------------------------
+    def _scan_settings(self):
+        """Scan settings from the GUI as a dict; raises ValueError if invalid."""
+        try:
+            delays = scan_delays(float(self.scan_start_us.get()), float(self.scan_end_us.get()),
+                                 float(self.scan_step_us.get()))
+            mode = self.scan_mode.get()
+            n = int(self.scan_frames.get())
+            seconds = float(self.scan_seconds.get())
+            settle = float(self.scan_settle_s.get())
+        except tk.TclError:
+            raise ValueError("a field is empty or not a number")
+        if mode == "frames" and n < 1:
+            raise ValueError("frames per step must be >= 1")
+        if mode == "seconds" and seconds <= 0:
+            raise ValueError("time per step must be > 0")
+        if settle < 0:
+            raise ValueError("settle time must be >= 0")
+        return dict(delays=delays, mode=mode, n=n, seconds=seconds, settle=settle)
+
+    def _update_scan_summary(self, *args):
+        if self._scan is not None:
+            return   # keeps describing the running scan's own settings
+        try:
+            p = self._scan_settings()
+        except ValueError as e:
+            self.scan_summary.config(text=f"Invalid settings: {e}", foreground="red")
+            return
+        d = p["delays"]
+        shown = ", ".join(f"{x:g}" for x in d) if len(d) <= 8 else \
+            f"{d[0]:g}, {d[1]:g}, {d[2]:g}, …, {d[-1]:g}"
+        if p["mode"] == "frames":
+            per = f"{p['n']} frames per step = {p['n'] * len(d)} frames"
+        else:
+            total = len(d) * (p["seconds"] + p["settle"])
+            per = f"{p['seconds']:g} s per step ≈ " + (f"{total:.0f} s" if total < 120 else
+                                                       f"{total / 60:.1f} min") + " in total"
+        self.scan_summary.config(text=f"{len(d)} steps: {shown} µs — {per}",
+                                 foreground="")
+
+    def toggle_delay_scan(self):
+        if self._scan is not None:
+            self._finish_delay_scan("stopped")
+        else:
+            self._start_delay_scan()
+
+    def _start_delay_scan(self):
+        if not self.streaming or not self.cam:
+            messagebox.showwarning("Warning", "Start streaming first")
+            return
+        if self.acquiring:
+            messagebox.showwarning("Warning", "Stop the running acquisition first")
+            return
+        if not (self.save_h5_var.get() or self.save_png_var.get()):
+            messagebox.showwarning("Warning", "Neither HDF5 nor PNG saving is ticked "
+                                              "(Acquisition tab)")
+            return
+        try:
+            p = self._scan_settings()
+        except ValueError as e:
+            messagebox.showerror("Delay scan", f"Invalid settings: {e}")
+            return
+        folder = self._new_run_folder()
+        if folder is None:
+            return
+        log_path = os.path.join(folder, "scan_log.csv")
+        try:
+            with open(log_path, "w", newline="") as f:
+                f.write(f"# delay scan {self._run_name}, started "
+                        f"{datetime.now(timezone.utc).isoformat()}\n")
+                f.write(f"# start {self.scan_start_us.get():g} us, end {self.scan_end_us.get():g} us, "
+                        f"step {self.scan_step_us.get():g} us, per step: "
+                        + (f"{p['n']} frames" if p["mode"] == "frames" else f"{p['seconds']:g} s")
+                        + f", settle {p['settle']:g} s, debounce "
+                        f"{self.trigger_debounce_ns.get()} ns, exposure {self.exp_var.get():g} us\n")
+                csv.writer(f).writerow(["step", "delay_set_us", "delay_camera_us", "frames",
+                                        "start_utc", "end_utc", "status", "folder"])
+        except OSError as e:
+            messagebox.showerror("Delay scan", f"Cannot write {log_path}:\n{e}")
+            return
+
+        self.trigger_index = 0
+        self.total_frames_saved = 0
+        self._scan = dict(p, idx=-1, phase="switching", count=0, t0=0.0, measure_t0=0.0,
+                          actual=None, completed=0,
+                          step_dir="", png_dir="", start_utc="", log=log_path,
+                          n_steps=len(p["delays"]))
+        self.acquiring = True
+        self.acq_btn.config(state="disabled")
+        self.sw_trigger_btn.config(state="disabled")
+        self.scan_btn.config(text="Stop Delay Scan")
+        self.scan_progress.config(value=0.0)
+        self._configure_camera_trigger(hardware=True)
+        self._hw_arm_time = time.time()
+        self.stat_h5dir.config(text=f"H5 folder: {folder}  (delay scan: {self._run_name})")
+        self._update_stats()
+        self._scan_next_step()
+        if self._scan is not None:
+            self.root.after(50, self._scan_poll)
+
+    def _scan_log_step(self, s, status):
+        """Append the current step of scan state s to scan_log.csv."""
+        if s["idx"] < 0 or s["idx"] >= s["n_steps"]:
+            return
+        if status == "complete":
+            s["completed"] += 1
+        try:
+            with open(s["log"], "a", newline="") as f:
+                csv.writer(f).writerow([
+                    s["idx"] + 1, f"{s['delays'][s['idx']]:g}",
+                    "" if s["actual"] is None else f"{s['actual']:g}", s["count"],
+                    s["start_utc"], datetime.now(timezone.utc).isoformat(), status,
+                    os.path.basename(s["step_dir"])])
+        except OSError as e:
+            print(f"scan_log.csv warning: {e}")
+
+    def _scan_next_step(self):
+        """Close the current step (if any) and set up the next one, or finish."""
+        s = self._scan
+        with self._scan_lock:
+            s["phase"] = "switching"   # the frame handler saves nothing meanwhile
+        self._scan_log_step(s, "complete")
+        idx = s["idx"] + 1
+        if idx >= s["n_steps"]:
+            s["idx"] = idx   # already logged
+            self._finish_delay_scan("complete")
+            return
+        delay = s["delays"][idx]
+        actual = self._send_trigger_delay(delay)
+        if actual is None:
+            s["idx"] = s["n_steps"]
+            self._finish_delay_scan("error")
+            messagebox.showerror("Delay scan", f"The camera did not accept trigger delay "
+                                               f"{delay:g} µs; scan stopped.")
+            return
+        name = f"step{idx + 1:03d}_delay{delay_label(delay)}"
+        step_dir = os.path.join(self._run_dir, name)
+        png_dir = os.path.join(step_dir, f"{name}_frames")
+        try:
+            os.makedirs(step_dir, exist_ok=True)
+            if self.save_png_var.get():
+                os.makedirs(png_dir, exist_ok=True)
+        except OSError as e:
+            s["idx"] = s["n_steps"]
+            self._finish_delay_scan("error")
+            messagebox.showerror("Delay scan", f"Cannot create {step_dir}:\n{e}")
+            return
+        now = time.time()
+        # Frames count from the end of the settle time, and never within 0.5 s of arming
+        # (free-run frames from before TriggerMode=On), so the first step of a timed scan
+        # gets its full time too.
+        measure_t0 = max(now + s["settle"], self._hw_arm_time + 0.5)
+        with self._scan_lock:
+            s.update(idx=idx, count=0, actual=actual, step_dir=step_dir, png_dir=png_dir,
+                     prefix=f"{self._run_name}_{name}", t0=now, measure_t0=measure_t0,
+                     start_utc=datetime.now(timezone.utc).isoformat(), phase="measure")
+
+    def _scan_frame(self, img: np.ndarray, raw_frame):
+        """Frame handler thread: save the frame into the current step, if it counts."""
+        s = self._scan
+        if s is None:
+            return
+        now = time.time()
+        with self._scan_lock:
+            if (s["phase"] != "measure" or now < s["measure_t0"]
+                    or (s["mode"] == "frames" and s["count"] >= s["n"])):
+                return
+            s["count"] += 1
+            idx, step_dir, png_dir, prefix, actual = (s["idx"], s["step_dir"], s["png_dir"],
+                                                      s["prefix"], s["actual"])
+        self._save_hardware_trigger_frame(
+            img, raw_frame, folder=step_dir, png_dir=png_dir, delay_us=actual, prefix=prefix,
+            extra=dict(scan_step=idx + 1, scan_n_steps=s["n_steps"],
+                       scan_delay_set_us=s["delays"][idx]))
+
+    def _scan_poll(self):
+        """GUI thread: show progress and move on when the step has enough frames or time."""
+        s = self._scan
+        if s is None or not self.acquiring:
+            return
+        now = time.time()
+        with self._scan_lock:
+            idx, count, phase = s["idx"], s["count"], s["phase"]
+            measure_t0 = s.get("measure_t0", 0.0)
+        if phase == "measure":
+            if s["mode"] == "frames":
+                frac = count / s["n"]
+                done = count >= s["n"]
+                txt = f"{count}/{s['n']} frames"
+            else:
+                elapsed = max(now - measure_t0, 0.0)
+                frac = min(elapsed / s["seconds"], 1.0)
+                done = now >= measure_t0 + s["seconds"]
+                txt = f"{count} frames, {max(s['seconds'] - elapsed, 0):.1f} s left"
+            if now < measure_t0:
+                txt = "settling…"
+            self.scan_status.config(text=f"Step {idx + 1}/{s['n_steps']}: delay "
+                                         f"{s['actual']:g} µs — {txt}")
+            self.scan_progress.config(value=(idx + frac) / s["n_steps"])
+            if done:
+                self._scan_next_step()
+        if self._scan is not None:
+            self.root.after(50, self._scan_poll)
+
+    def _finish_delay_scan(self, status):
+        """End the scan ("complete", "stopped" or "error") and return to live view."""
+        s = self._scan
+        if s is None:
+            return
+        with self._scan_lock:
+            s["phase"] = "done"
+        if status != "complete":
+            self._scan_log_step(s, status)   # the interrupted step
+        self._scan = None
+        try:
+            with open(s["log"], "a") as f:
+                f.write(f"# {status}, {datetime.now(timezone.utc).isoformat()}, "
+                        f"{self.total_frames_saved} frames saved\n")
+        except OSError:
+            pass
+        # back to the delay typed on the Acquisition tab
+        if self.cam and self.streaming:
+            try:
+                self._send_trigger_delay(float(self.trigger_delay_us.get()))
+            except (tk.TclError, ValueError):
+                pass
+        self.scan_btn.config(text="Start Delay Scan")
+        if status == "complete":
+            self.scan_progress.config(value=1.0)
+        self.scan_status.config(text=f"Scan {status}: {s['completed']}/{s['n_steps']} steps complete, "
+                                     f"{self.total_frames_saved} frames in {self._run_dir}")
+        self._stop_acquisition()
+        self._update_scan_summary()
 
     # --------------------------------------------------------------------------
     # Display & stats
