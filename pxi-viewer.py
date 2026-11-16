@@ -2369,6 +2369,8 @@ class PatternViewer(QtWidgets.QMainWindow):
         mask = self._active_mask()
         self.hits = dict(res, bin=self._bin, bin_mode=self._bin_mode(),
                          threshold=self.hit_thr.value(), min_size=self.hit_min.value(),
+                         bin_thresh=self.bin_thresh.value() / 100.0,
+                         rescale=self.rescale_chk.isChecked(),
                          dark=self.dark_combo.currentText() if dark is not None else "",
                          n_masked=int(mask.sum()) if mask is not None else 0,
                          mask=None if mask is None else mask.copy(),
@@ -2520,6 +2522,7 @@ class PatternViewer(QtWidgets.QMainWindow):
                 detector_diameter_mm=self.det_mm.value(),
                 detector_diameter_px=self.det_px.value(),
                 bin_factor=b, bin_mode=h["bin_mode"], threshold=h["threshold"],
+                bin_hide_threshold=h["bin_thresh"], bin_rescale=int(h["rescale"]),
                 min_size=h["min_size"], n_masked_px=h["n_masked"], dark_run=h["dark"]))
             if self.circle is not None:
                 f.attrs["detector_circle_px"] = np.asarray(self.circle, dtype=float)

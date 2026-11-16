@@ -7,6 +7,7 @@ screen imaged by a camera. It has two programs:
 |---|---|
 | `Mako_v14.py` | Controls an Allied Vision **Mako G-032B** GigE camera: live view, camera settings, saving one HDF5 file per trigger (hardware or software), trigger-delay scans, setup notes in every file, and a missed-shot check. |
 | `pxi-viewer.py` | Interactive viewer for the saved frames: browse, sort by intensity, mean/median/std, binning, masks, histograms, hit finding and export, a live tab that follows the camera while it records, and a scan tab for intensity and hits against trigger delay. |
+| `hits_to_directions.py` | Turns the viewer's hits export into ion directions per shot, with the detector's field of view, for orientation retrieval (OREO) and ion maps. |
 | `requirements.txt` | Pinned package versions for both programs (Python 3.11). |
 | `run_mako.bat`, `run_pxi_viewer.bat` | Windows launchers using a `.venv` next to the scripts. |
 | `vimba_viewer.bat` | Starts Allied Vision's Vimba X Viewer with only Allied Vision's own transport layers (see below). |
@@ -215,6 +216,46 @@ Full sensor is 658 × 492 px (W × H) at binning 1. PNGs go to
   "Triggers received" stays 0: check pin 4/5 wiring and polarity, that the pulse is above
   3 V and longer than the debounce time, and the trigger mode. A black live view in
   hardware mode is normal without pulses.
+
+## Hits → ion directions (`hits_to_directions.py`)
+
+```bash
+python hits_to_directions.py hits.h5 [-o directions.h5] [--L MM] [--mirror]
+                             [--min-hits N] [--nside 64] [--plot quicklook.png]
+```
+
+Turns a hits export into one set of unit vectors per shot, the input of orientation
+retrieval (OREO) and of ion maps. Needs numpy and h5py; healpy for the HEALPix field of
+view, matplotlib for `--plot`.
+
+- **Geometry:** the detector is flat at flight distance L, and the viewer's hit centre is
+  taken as the foot of the perpendicular from the interaction point. A hit at (x, y) mm
+  (image axes, relative to the centre) is u = normalize(L, x, −y), in the frame of OREO and
+  `explode_tools`: +x is the detector normal from the interaction point to the detector, and
+  u lands at (L, L·u_y/u_x, L·u_z/u_x).
+- **L** comes from the export (`flight_distance_mm`, i.e. the camera program's Setup
+  Notes) or `--L`. If frames of different distances were exported together, it stops and
+  asks for one distance at a time.
+- **Handedness:** whether the camera sees the phosphor from the front, from behind or via
+  a mirror flips the image. Without `--mirror`, the image is taken as seen from the detector
+  looking towards the interaction point. Directions and orientation retrieval do not
+  depend on it, but the chirality of a reconstructed shape does: check it once with an
+  asymmetric object of known orientation in front of the detector (e.g. the mesh).
+- **Field of view:** the directions the hit finder could report. A direction counts if it
+  lands in a bin the viewer used (masked fraction below *Hide bin at*, full bins only) with
+  its centre inside the active circle. It is saved as a native-pixel mask (`fov/mask`) and
+  as a HEALPix map (`fov_mask`, RING, at `--nside`). Hits outside it are dropped and
+  counted. This replaces OREO's square-plate mask for real data; the circle's half-angle
+  is atan(R/L).
+- **Output** (`<hits>_directions.h5` by default): `directions` (F, Hmax, 3) NaN-padded,
+  `n_hits`, `frame_index` (row in the hits export, for `files` and `run_index` there),
+  `fov_mask`, `fov/…`, and attributes `flight_distance_mm`, `mirror`, `convention`,
+  `fov_max_angle_deg`, `hits_outside_fov`, plus the viewer's settings as `hits_*`.
+- **From Python:** `load_directions(path)` returns the rays per shot and the field of view;
+  `fov_contains(u, fov)` and `fov_healpix_mask(fov, nside)` test directions or build the mask
+  at another resolution.
+- **`--plot`:** hits on the detector, directions around the detector normal (with the
+  field-of-view edge), and hits per shot.
 
 ## PXI-viewer (`pxi-viewer.py`)
 
@@ -459,7 +500,8 @@ file uses 1 = good, press **Invert** after loading.
 
 File attributes: `center_x_px`, `center_y_px`, `mm_per_px`, `detector_diameter_mm`,
 `detector_diameter_px`, `detector_circle_px` (cx, cy, R, if fitted), `bin_factor`,
-`bin_mode`, `threshold`, `min_size`, `n_masked_px`, `dark_run`, and
+`bin_mode`, `bin_hide_threshold`, `bin_rescale`, `threshold`, `min_size`, `n_masked_px`,
+`dark_run`, and
 `flight_distance_mm` when the frames carry it (`setup_flight_distance_mm` from the camera
 program). If the frames disagree, the attribute is NaN, their values are in
 `flight_distance_mm_values` and a dataset `flight_distance_mm` (F,) gives it per frame.
