@@ -1,0 +1,9 @@
+vmbpy==1.2.2
+opencv-python==5.0.0.93
+pillow==12.3.0
+h5py==3.16.0
+numpy==2.5.3
+# PXI-viewer
+pyqtgraph==0.14.0
+PyQt5==5.15.11
+scipy==1.18.1

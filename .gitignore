@@ -1,0 +1,11 @@
+# data, masks and local environments are not part of the repository
+masks/
+data_camera/
+*.h5
+*.hdf5
+*.npy
+*.png
+*.whl
+.venv/
+__pycache__/
+*.part
