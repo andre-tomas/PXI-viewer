@@ -5,8 +5,8 @@ screen imaged by a camera. It has two programs:
 
 | file | what it does |
 |---|---|
-| `Mako_v14.py` | Controls an Allied Vision **Mako G-032B** GigE camera: live view, camera settings, and saving one HDF5 file per trigger (hardware or software). |
-| `pxi-viewer.py` | Interactive viewer for the saved frames: browse, sort by intensity, mean/median/std, binning, masks, histograms, hit finding and export, and a live tab that follows the camera while it records. |
+| `Mako_v14.py` | Controls an Allied Vision **Mako G-032B** GigE camera: live view, camera settings, saving one HDF5 file per trigger (hardware or software), trigger-delay scans, setup notes in every file, and a missed-shot check. |
+| `pxi-viewer.py` | Interactive viewer for the saved frames: browse, sort by intensity, mean/median/std, binning, masks, histograms, hit finding and export, a live tab that follows the camera while it records, and a scan tab for intensity and hits against trigger delay. |
 | `requirements.txt` | Pinned package versions for both programs (Python 3.11). |
 | `run_mako.bat`, `run_pxi_viewer.bat` | Windows launchers using a `.venv` next to the scripts. |
 | `vimba_viewer.bat` | Starts Allied Vision's Vimba X Viewer with only Allied Vision's own transport layers (see below). |
@@ -142,12 +142,40 @@ found), sets Mono8, turns auto exposure/gain off and negotiates the GigE packet 
         step003_delay12p5us/…             (12.5 µs; '.' becomes 'p')
     ```
 
-    `scan_log.csv` (lines starting with `#` are comments: settings, end status) has the
-    columns `step, delay_set_us, delay_camera_us, frames, start_utc, end_utc, status,
-    folder`, with status `complete`, `stopped` or `error`. Each frame also records
+    `scan_log.csv` (lines starting with `#` are comments: settings, setup notes, end
+    status) has the columns `step, delay_set_us, delay_camera_us, frames, start_utc,
+    end_utc, status, folder, missed_shots_est, dropped_frames, incomplete_frames`, with
+    status `complete`, `stopped` or `error` (missed shots: see below). Each frame also records
     `scan_step`, `scan_n_steps` and `scan_delay_set_us`, and `trigger_delay_us` is the
     delay the camera actually used. Frame numbers (`trigger_index`) count through the
-    whole scan.
+    whole scan. The viewer's **Scan** tab plots a scan (see below).
+- **Setup Notes:** flight distance L from the interaction point to the detector (mm),
+  MCP front and back and phosphor voltages (V), sample, and a free-text note.
+  - Saved as attributes `setup_flight_distance_mm`, `setup_mcp_front_V`,
+    `setup_mcp_back_V`, `setup_phosphor_V`, `setup_sample` and `setup_note` of **every
+    frame** (numbers: empty = NaN; a field that is not a number is marked red and saved
+    as NaN). Changes apply from the next frame on, also during an acquisition.
+  - Kept for the next session in `mako_setup.json` next to the script.
+  - **Fill in the flight distance**: turning hit positions into ion directions needs it,
+    and the viewer's hits export copies it.
+
+### Missed shots (hardware trigger)
+
+During a hardware-triggered acquisition or delay scan every received frame is checked:
+
+- **Dropped in transfer:** the camera numbers its frames; a jump in `camera_frame_id`
+  means frames the camera sent but the PC never received (network, buffers).
+- **Incomplete:** frames the camera marks as incomplete (missing packets) are saved but
+  flagged with `frame_complete = 0`.
+- **Missed shots (est.):** an interval between camera timestamps more than 1.5 × the
+  median of the last 50 intervals means round(interval / median) − 1 shots without a
+  frame, e.g. triggers the camera ignored because it was still reading out
+  (`TriggerOverlap=Off`), or dropped frames. Assumes a steady trigger rate: a deliberate
+  pause of the laser also counts.
+
+The totals are shown in red in the Acquisition tab's statistics once anything is
+missed, are listed per step in `scan_log.csv`, and are written to `run_info.json`. The
+Scan tab of the viewer sums them per delay.
 
 ### Output files
 
@@ -158,9 +186,17 @@ and renamed when complete (so the viewer's Live tab never reads a half-written f
 frames/                       attrs: trigger_index, exposure_frames, saved_time_utc
 frames/frame_0000             uint8 (H, W), gzip; one dataset per frame of the trigger
     attrs: trigger_mode, trigger_delay_us, frame_index, trigger_index,
-           wall_time_utc_s, wall_time_iso, camera_timestamp_ns, exposure_us, gain_dB,
-           gamma, black_level, binning_h, binning_v, width, height, pixel_format
+           wall_time_utc_s, wall_time_iso, camera_timestamp_ns, camera_timestamp_tick_hz,
+           exposure_us, gain_dB, gamma, black_level, binning_h, binning_v, width, height,
+           pixel_format, setup_* (Setup Notes);
+           hardware trigger also: camera_frame_id, frame_complete (1/0, -1 unknown),
+           shot_interval_ms, missed_before (shots without a frame before this one);
+           delay scan also: scan_step, scan_n_steps, scan_delay_set_us
 ```
+
+Every run folder also gets `run_info.json`: camera settings, trigger settings and setup
+notes at the start; at the end the status, number of triggers and frames, the setup notes
+at the end, and the missed-shot totals.
 
 Full sensor is 658 × 492 px (W × H) at binning 1. PNGs go to
 `<run>/<run>_<start time>_frames/`.
@@ -171,7 +207,8 @@ Full sensor is 658 × 492 px (W × H) at binning 1. PNGs go to
   because free-run frames already buffered before `TriggerMode=On` took effect would otherwise
   count as triggers. Real shots in that window are lost too.
 - **Timestamps:** `wall_time_utc_s` is when the PC received the frame, not the shot time.
-  `camera_timestamp_ns` is the camera's own clock.
+  `camera_timestamp_ns` is the camera's own clock, in ticks of
+  `camera_timestamp_tick_hz` (1 GHz, i.e. ns, unless the camera reports otherwise).
 - **Settings metadata:** Exposure, gain, etc. in the metadata are the GUI values (which are read back from the
   camera when changed).
 - **No triggers or dark image:** "No cameras found": check the Vimba X install and the network adapter's IP.
@@ -198,13 +235,16 @@ python pxi-viewer.py [DATA_DIR ...] [--key DATASET]
   use **Add folder…** to scan more folders.
 - The frame is the first 2D numeric dataset in each file, or the one named with
   `--key` (e.g. `--key entry/data/image`). All frames of a run must have the same shape.
+- A file can hold a **burst** of frames (e.g. `frames/frame_0000`, `frame_0001`, … from a
+  software trigger): every 2D dataset of the same shape in the group of the first one is
+  loaded as a frame, in natural order. The Info box then shows the dataset name.
 - Files in a run are ordered by natural sort of their names (`img2` before `img10`).
 - Scalar attributes of the frame dataset (exposure, timestamps, …) are shown per frame.
 - Directories with `dark` in their name are offered as dark runs.
 
 ### Window overview
 
-The left side has three tabs (**Image**, **Histograms**, **Hits**). On the right is a
+The left side has five tabs (**Image**, **Histograms**, **Hits**, **Live**, **Scan**). On the right is a
 side panel whose width you can change with the splitter handle. The mouse wheel
 scrolls the panel and never changes a setting.
 
@@ -371,6 +411,29 @@ program.
   percentile limits (side panel) for the shown frame once. Tick **auto limits every
   frame** to have them recomputed for each new frame.
 
+#### Scan tab
+
+Mean total intensity per frame (and optionally hits per frame) against the trigger
+delay, for finding the timing.
+
+- **Scan** lists the delay scans among the runs (folders with `scan_log.csv`, whose step
+  subfolders are runs). **Select its steps** selects them in the run list. Any other
+  selection of runs works too, e.g. runs taken by hand at different delays.
+- **Group by** *trigger delay* gives one point per value of the frames'
+  `trigger_delay_us` attribute (the delay the camera used; frames without it are grouped
+  by run), *run* one point per run.
+- **count hits** also counts hits per frame with the Hits tab's threshold and min size and
+  the current binning.
+- **Compute from selected runs** reads every frame of the selected runs (without loading
+  them into the viewer), with the dark and mask of the side panel, the same total
+  intensity as in the Image tab.
+- The plots show the mean per frame ± its standard error, and the table adds the number
+  of frames, the fraction of frames with hits, and the missed shots and incomplete frames
+  recorded by the camera program. Compare means per frame, not sums: steps can have
+  different frame counts.
+- Click a point (or double-click a table row) to load those runs into the viewer.
+  **Export CSV…** saves the table, with the settings in a `#` comment line.
+
 ### File formats
 
 #### Mask (`.h5` / `.npy`)
@@ -390,13 +453,16 @@ file uses 1 = good, press **Invert** after loading.
 | `n_hits` | (F,) | number of hits in frame f; slots `h ≥ n_hits[f]` are NaN |
 | `hits_rel_px` | (F, Hmax, 2) | (x, y) relative to the centre in native pixels |
 | `hit_peak`, `hit_size`, `hit_sum` | (F, Hmax) | brightest binned value, size in binned pixels, summed value |
-| `files` | (F,) | source file of each frame |
+| `files`, `frame_dataset` | (F,) | source file of each frame, and its dataset in that file |
 | `run_index`, `runs` | (F,), (n_runs,) | which loaded run each frame came from |
 | `mask` | (H, W) | the mask that was applied (if any) |
 
 File attributes: `center_x_px`, `center_y_px`, `mm_per_px`, `detector_diameter_mm`,
 `detector_diameter_px`, `detector_circle_px` (cx, cy, R, if fitted), `bin_factor`,
-`bin_mode`, `threshold`, `min_size`, `n_masked_px`, `dark_run`.
+`bin_mode`, `threshold`, `min_size`, `n_masked_px`, `dark_run`, and
+`flight_distance_mm` when the frames carry it (`setup_flight_distance_mm` from the camera
+program). If the frames disagree, the attribute is NaN, their values are in
+`flight_distance_mm_values` and a dataset `flight_distance_mm` (F,) gives it per frame.
 
 Conventions:
 - Frames are in file order (not the browsing sort order).
@@ -462,8 +528,5 @@ dark and mask applied.
 - The circle finder needs a run in which the active area is visible (short exposure,
   enough counts). For empty or long-exposure runs it reports that no usable edge was
   found.
-- Browsing reads only the **first** 2D dataset of each file (or `--key`), so of a
-  software-trigger burst (several `frames/frame_NNNN` in one file) only the first frame is
-  loaded. The Live tab reads every frame of a file.
-- The hits export has no flight distance: turning hit positions into ion directions
-  needs the detector distance from the setup, and image y points down.
+- Turning hit positions into ion directions needs the flight distance, which is only in
+  the export when it was entered in the camera program's Setup Notes. Image y points down.

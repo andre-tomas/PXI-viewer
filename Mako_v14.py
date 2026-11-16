@@ -60,6 +60,15 @@ v13 -> v14:
     switches back to Off (free-run), the camera re-applies the stored
     AcquisitionFrameRateAbs value. Now explicitly set to
     AcquisitionFrameRateLimit (camera maximum) on every stop.
+v15 -> v16:
+  - Setup Notes tab: flight distance, MCP/phosphor voltages, sample and a note
+    are saved as setup_* attributes with every frame and kept between sessions
+    (mako_setup.json next to the script). Every run folder gets run_info.json
+    (camera, trigger and setup settings at the start, totals at the end).
+  - Missed-shot check in hardware mode: frames record camera_frame_id,
+    frame_complete, shot_interval_ms and missed_before (shots without a frame
+    before this one, estimated from gaps in the camera timestamps). Totals are
+    shown in the Acquisition tab and listed per step in scan_log.csv.
 v14 -> v15:
   - Delay scan (own tab): steps the hardware trigger delay from a start to an
     end value and records a fixed number of frames, or a fixed time, per step.
@@ -96,7 +105,9 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import csv
+import json
 import math
+from collections import deque
 import os
 import re
 from datetime import datetime, timezone
@@ -204,6 +215,105 @@ def scan_delays(start: float, end: float, step: float, max_steps: int = 10000) -
     return [round(start + sign * i * step, 6) for i in range(n)]
 
 
+SETUP_FIELDS = [   # (key, label, numeric) of the Setup Notes tab; attribute = "setup_" + key
+    ("flight_distance_mm", "Flight distance L, interaction point → detector (mm)", True),
+    ("mcp_front_V", "MCP front (V)", True),
+    ("mcp_back_V", "MCP back (V)", True),
+    ("phosphor_V", "Phosphor screen (V)", True),
+    ("sample", "Sample", False),
+    ("note", "Note", False),
+]
+
+
+def parse_number(text: str) -> float:
+    """'1,5' or ' 1.5 ' -> 1.5; empty -> NaN; raises ValueError for other text."""
+    text = text.strip().replace(",", ".")
+    return float(text) if text else float("nan")
+
+
+def json_safe(obj):
+    """NaN/inf -> None and numpy scalars -> Python, so json.dump writes valid JSON."""
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
+class ShotTracker:
+    """Detects shots without a saved frame during a hardware-triggered acquisition.
+
+    - camera frame IDs that jump by more than 1: frames the camera sent but the PC
+      never received (dropped in transfer);
+    - frames the camera marks as incomplete (missing packets);
+    - gaps in the camera timestamps: an interval more than `gap_factor` times the
+      median of the last `window` intervals means round(interval / median) - 1
+      shots without a frame (triggers ignored during readout, dropped frames, …).
+      This assumes a steady trigger rate; a deliberate pause of the laser also
+      counts as missed shots.
+    """
+
+    def __init__(self, tick_hz=1e9, window=50, gap_factor=1.5, min_intervals=5):
+        self.tick_hz, self.gap_factor, self.min_intervals = tick_hz, gap_factor, min_intervals
+        self.intervals = deque(maxlen=window)
+        self.reset()
+
+    def reset(self):
+        self.last_id = self.last_ts = None
+        self.intervals.clear()
+        self.frames = self.dropped = self.missed = self.incomplete = 0
+
+    def counts(self) -> dict:
+        return dict(missed=self.missed, dropped=self.dropped, incomplete=self.incomplete)
+
+    def update(self, frame_id, timestamp, complete) -> dict:
+        """Register one received frame; returns its attributes for the saved file."""
+        self.frames += 1
+        out = dict(camera_frame_id=-1 if frame_id is None else int(frame_id),
+                   frame_complete=-1 if complete is None else int(bool(complete)),
+                   shot_interval_ms=float("nan"), missed_before=0)
+        if complete is False:
+            self.incomplete += 1
+        if frame_id is not None:
+            if self.last_id is not None and frame_id > self.last_id + 1:
+                self.dropped += frame_id - self.last_id - 1
+            self.last_id = frame_id
+        if timestamp is not None:
+            if self.last_ts is not None and timestamp > self.last_ts:
+                dt = timestamp - self.last_ts
+                out["shot_interval_ms"] = dt / self.tick_hz * 1e3
+                if len(self.intervals) >= self.min_intervals:
+                    med = float(np.median(self.intervals))
+                    if dt > self.gap_factor * med:
+                        k = max(int(round(dt / med)) - 1, 1)
+                        self.missed += k
+                        out["missed_before"] = k
+                self.intervals.append(dt)
+            self.last_ts = timestamp
+        return out
+
+
+def frame_quality(frame):
+    """(frame ID, camera timestamp, complete) of a vmbpy frame; None where unknown."""
+    try:
+        fid = frame.get_id()
+    except Exception:
+        fid = None
+    try:
+        ts = frame.get_timestamp()
+    except Exception:
+        ts = None
+    try:
+        complete = frame.get_status() == FrameStatus.Complete
+    except Exception:
+        complete = None
+    return fid, ts, complete
+
+
 def delay_label(delay: float) -> str:
     """Delay as a file-name part: 120 -> '120us', 12.5 -> '12p5us'."""
     return f"{delay:g}".replace(".", "p") + "us"
@@ -277,6 +387,17 @@ class MakoCameraGUI:
         self.scan_frames = tk.IntVar(value=100)
         self.scan_seconds = tk.DoubleVar(value=10.0)
         self.scan_settle_s = tk.DoubleVar(value=0.5)
+        # Setup notes, saved with every frame (kept in mako_setup.json between sessions)
+        self.setup_vars = {k: tk.StringVar(value="") for k, _, _ in SETUP_FIELDS}
+        self._setup_meta = {}                   # setup_* attributes; replaced, never mutated
+        self._setup_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "mako_setup.json")
+        self._setup_save_job = None
+        self._load_setup()
+        # missed-shot check (hardware trigger) and run_info.json of the current run
+        self._shots = ShotTracker()
+        self._tick_hz = 1e9                     # camera timestamp ticks per second
+        self._run_info = None
         self._scan = None                       # state dict while a scan runs
         self._scan_lock = threading.Lock()      # shared with the frame handler thread
 
@@ -300,6 +421,7 @@ class MakoCameraGUI:
         self._build_settings_tab()
         self._build_acquisition_tab()
         self._build_scan_tab()
+        self._build_setup_tab()
 
         if not PIL_AVAILABLE:
             messagebox.showwarning("Missing Library", "Install Pillow for live preview")
@@ -472,6 +594,8 @@ class MakoCameraGUI:
         self.stat_triggers.pack(anchor=tk.W)
         self.stat_frames = ttk.Label(stats, text="Frames saved: 0")
         self.stat_frames.pack(anchor=tk.W)
+        self.stat_shots = ttk.Label(stats, text="Missed shots: —")
+        self.stat_shots.pack(anchor=tk.W)
         self.stat_h5dir = ttk.Label(stats, text="H5 folder: —", foreground="gray")
         self.stat_h5dir.pack(anchor=tk.W)
 
@@ -543,6 +667,114 @@ class MakoCameraGUI:
             var.trace_add("write", self._update_scan_summary)
         self._update_scan_summary()
 
+    def _build_setup_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text=" Setup Notes ")
+        box = ttk.LabelFrame(tab, text="Saved with every frame", padding=12)
+        box.pack(fill=tk.X, padx=15, pady=15)
+        box.columnconfigure(1, weight=1)
+        self._setup_warn = {}
+        for r, (key, label, numeric) in enumerate(SETUP_FIELDS):
+            ttk.Label(box, text=label + ":").grid(row=r, column=0, sticky=tk.W, padx=5, pady=5)
+            ttk.Entry(box, textvariable=self.setup_vars[key],
+                      width=14 if numeric else 60).grid(row=r, column=1, sticky=tk.W, padx=8)
+            if numeric:
+                self._setup_warn[key] = ttk.Label(box, text="", foreground="red")
+                self._setup_warn[key].grid(row=r, column=2, sticky=tk.W)
+        ttk.Label(tab, text="Each field is saved as an attribute setup_<name> of every frame "
+                            "(numbers in the units shown, empty = NaN), and in run_info.json "
+                            "of each run. Changes apply to the next frame, also during an "
+                            "acquisition. The values are kept for the next session in "
+                            "mako_setup.json next to this script.\nThe flight distance is "
+                            "needed to turn hit positions into ion directions — please fill "
+                            "it in.", foreground="gray", wraplength=900,
+                  justify=tk.LEFT).pack(anchor=tk.W, padx=15)
+        for var in self.setup_vars.values():
+            var.trace_add("write", self._setup_changed)
+        self._setup_changed()
+
+    def _load_setup(self):
+        try:
+            with open(self._setup_file) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return
+        for key, var in self.setup_vars.items():
+            if saved.get(key) is not None:
+                var.set(str(saved[key]))
+
+    def _setup_changed(self, *args):
+        """GUI thread: rebuild the setup_* attributes and save the fields soon."""
+        meta, raw = {}, {}
+        for key, _, numeric in SETUP_FIELDS:
+            text = self.setup_vars[key].get()
+            raw[key] = text
+            if numeric:
+                try:
+                    meta["setup_" + key] = parse_number(text)
+                    warn = ""
+                except ValueError:
+                    meta["setup_" + key] = float("nan")
+                    warn = "not a number — saved as NaN"
+                if key in getattr(self, "_setup_warn", {}):
+                    self._setup_warn[key].config(text=warn)
+            else:
+                meta["setup_" + key] = text.strip()
+        self._setup_meta = meta     # one assignment: the frame handler sees old or new
+        if self._setup_save_job is not None:
+            self.root.after_cancel(self._setup_save_job)
+        self._setup_save_job = self.root.after(1000, lambda: self._save_setup(raw))
+
+    def _save_setup(self, raw):
+        self._setup_save_job = None
+        try:
+            with open(self._setup_file, "w") as f:
+                json.dump(raw, f, indent=1)
+        except OSError as e:
+            print(f"mako_setup.json warning: {e}")
+
+    # --------------------------------------------------------------------------
+    # run_info.json: settings at the start of a run, totals at its end
+    # --------------------------------------------------------------------------
+    def _begin_run_info(self, kind, extra=None):
+        hw = kind == "delay scan" or "Hardware" in self.trigger_mode_var.get()
+        info = dict(
+            run=self._run_name, kind=kind,
+            started_utc=datetime.now(timezone.utc).isoformat(),
+            camera=dict(model=self.cam.get_name() if self.cam else "",
+                        exposure_us=self.exp_var.get(), gain_dB=self.gain_var.get(),
+                        gamma=self.gamma_var.get(), black_level=self.black_var.get(),
+                        binning_h=self.bin_h_var.get(), binning_v=self.bin_v_var.get()),
+            trigger=dict(mode="hardware" if hw else "software",
+                         delay_us=self._delay_value if hw else 0.0,
+                         debounce_ns=self.trigger_debounce_ns.get() if hw else None,
+                         frames_per_trigger=1 if hw else self.exposure_frames.get()),
+            setup=dict(self._setup_meta),
+            save=dict(h5=self.save_h5_var.get(), png=self.save_png_var.get()))
+        if extra:
+            info.update(extra)
+        self._run_info = dict(info=info, path=os.path.join(self._run_dir, "run_info.json"))
+        self._write_run_info()
+
+    def _end_run_info(self, status):
+        if self._run_info is None:
+            return
+        self._run_info["info"].update(
+            stopped_utc=datetime.now(timezone.utc).isoformat(), status=status,
+            triggers=self.trigger_index, frames_saved=self.total_frames_saved,
+            setup_at_end=dict(self._setup_meta),
+            shots=dict(self._shots.counts(), frames_received=self._shots.frames)
+            if self._run_info["info"]["trigger"]["mode"] == "hardware" else None)
+        self._write_run_info()
+        self._run_info = None
+
+    def _write_run_info(self):
+        try:
+            with open(self._run_info["path"], "w") as f:
+                json.dump(json_safe(self._run_info["info"]), f, indent=1)
+        except OSError as e:
+            print(f"run_info.json warning: {e}")
+
     # --------------------------------------------------------------------------
     # Streaming
     # --------------------------------------------------------------------------
@@ -573,6 +805,11 @@ class MakoCameraGUI:
                     except Exception as e:
                         print("GVSPAdjustPacketSize warning:", e)
                     self.cam.get_feature_by_name("PixelFormat").set("Mono8")
+                    try:   # camera timestamps count in these ticks
+                        self._tick_hz = float(self.cam.get_feature_by_name(
+                            "GevTimestampTickFrequency").get()) or 1e9
+                    except Exception:
+                        self._tick_hz = 1e9
                     try:
                         self.cam.get_feature_by_name("ExposureAuto").set("Off")
                         self.cam.get_feature_by_name("GainAuto").set("Off")
@@ -614,7 +851,7 @@ class MakoCameraGUI:
                             # --- Acquisition handling ---
                             if self.acquiring and self._scan is not None:
                                 # Delay scan: hardware trigger, saved per step
-                                self._scan_frame(img, frame)
+                                self._scan_frame(img, frame, self._track_shot(frame))
                             elif self.acquiring:
                                 # Hardware trigger mode: each frame is a trigger.
                                 # Discard frames that arrived within the first
@@ -623,8 +860,10 @@ class MakoCameraGUI:
                                 # VmbPy pipeline before TriggerMode=On took effect
                                 # and must not be counted as real triggers.
                                 if "Hardware" in self.trigger_mode_var.get():
+                                    quality = self._track_shot(frame)
                                     if time.time() - self._hw_arm_time > 0.5:
-                                        self._save_hardware_trigger_frame(img, frame)
+                                        self._save_hardware_trigger_frame(img, frame,
+                                                                          extra=quality)
                                 # Software trigger mode: collect burst if pending
                                 elif self._sw_trigger_pending:
                                     self._collect_software_trigger_frame(img, frame)
@@ -710,6 +949,8 @@ class MakoCameraGUI:
             trigger_mode="hardware",
             trigger_delay_us=self._delay_value if delay_us is None else delay_us,
         )
+        meta["camera_timestamp_tick_hz"] = self._tick_hz
+        meta.update(self._setup_meta)
         if extra:
             meta.update(extra)
 
@@ -770,6 +1011,8 @@ class MakoCameraGUI:
             trigger_mode="software",   # free run: no trigger delay applies
             trigger_delay_us=0.0,
         )
+        meta["camera_timestamp_tick_hz"] = self._tick_hz
+        meta.update(self._setup_meta)
         self._sw_collected_frames.append(img)
         self._sw_collected_metas.append(meta)
 
@@ -820,6 +1063,17 @@ class MakoCameraGUI:
         self._sw_collected_frames = []
         self._sw_collected_metas = []
 
+    def _track_shot(self, raw_frame) -> dict:
+        """Frame handler thread: missed-shot bookkeeping for one received frame.
+        Frames within 0.5 s of arming are free-run leftovers and are not counted."""
+        if time.time() - self._hw_arm_time < 0.5:
+            return {}
+        fid, ts, complete = frame_quality(raw_frame)
+        q = self._shots.update(fid, ts, complete)
+        if q["missed_before"] or complete is False:
+            self.root.after(0, self._update_stats)
+        return q
+
     # --------------------------------------------------------------------------
     # Acquisition start / stop
     # --------------------------------------------------------------------------
@@ -867,6 +1121,7 @@ class MakoCameraGUI:
         self.trigger_index = 0
         self.total_frames_saved = 0
         self._hw_arm_time = 0.0
+        self._shots = ShotTracker(self._tick_hz)
         self._sw_trigger_pending = False
         self._sw_collected_frames = []
         self._sw_collected_metas = []
@@ -885,6 +1140,7 @@ class MakoCameraGUI:
             # Record arm time so frame_handler can discard frames that were
             # already buffered in the VmbPy pipeline before TriggerMode=On.
             self._hw_arm_time = time.time()
+        self._begin_run_info("acquisition")
         self.status.config(text="Acquisition active — waiting for trigger…")
         self.stat_h5dir.config(text=f"H5 folder: {folder}  (run: {self._run_name})")
         self._update_stats()
@@ -893,8 +1149,11 @@ class MakoCameraGUI:
         if self._scan is not None:
             self._finish_delay_scan("stopped")   # ends the scan, then comes back here
             return
+        was_acquiring = self.acquiring
         self.acquiring = False
         self._sw_trigger_pending = False
+        if was_acquiring:
+            self._end_run_info("stopped")
         self.acq_btn.config(text="Start Acquisition")
         state = "normal" if self.streaming else "disabled"
         self.acq_btn.config(state=state)
@@ -1141,15 +1400,20 @@ class MakoCameraGUI:
                         + (f"{p['n']} frames" if p["mode"] == "frames" else f"{p['seconds']:g} s")
                         + f", settle {p['settle']:g} s, debounce "
                         f"{self.trigger_debounce_ns.get()} ns, exposure {self.exp_var.get():g} us\n")
+                f.write("# setup: " + ", ".join(f"{k[6:]}={v}" for k, v in
+                                                self._setup_meta.items()) + "\n")
                 csv.writer(f).writerow(["step", "delay_set_us", "delay_camera_us", "frames",
-                                        "start_utc", "end_utc", "status", "folder"])
+                                        "start_utc", "end_utc", "status", "folder",
+                                        "missed_shots_est", "dropped_frames",
+                                        "incomplete_frames"])
         except OSError as e:
             messagebox.showerror("Delay scan", f"Cannot write {log_path}:\n{e}")
             return
 
         self.trigger_index = 0
         self.total_frames_saved = 0
-        self._scan = dict(p, idx=-1, phase="switching", count=0, t0=0.0, measure_t0=0.0,
+        self._shots = ShotTracker(self._tick_hz)
+        self._scan = dict(p, shots0=self._shots.counts(), idx=-1, phase="switching", count=0, t0=0.0, measure_t0=0.0,
                           actual=None, completed=0,
                           step_dir="", png_dir="", start_utc="", log=log_path,
                           n_steps=len(p["delays"]))
@@ -1160,6 +1424,12 @@ class MakoCameraGUI:
         self.scan_progress.config(value=0.0)
         self._configure_camera_trigger(hardware=True)
         self._hw_arm_time = time.time()
+        self._begin_run_info("delay scan", dict(scan=dict(
+            start_us=float(self.scan_start_us.get()), end_us=float(self.scan_end_us.get()),
+            step_us=float(self.scan_step_us.get()), delays_us=p["delays"],
+            per_step=p["mode"], frames_per_step=p["n"] if p["mode"] == "frames" else None,
+            seconds_per_step=p["seconds"] if p["mode"] == "seconds" else None,
+            settle_s=p["settle"])))
         self.stat_h5dir.config(text=f"H5 folder: {folder}  (delay scan: {self._run_name})")
         self._update_stats()
         self._scan_next_step()
@@ -1172,13 +1442,16 @@ class MakoCameraGUI:
             return
         if status == "complete":
             s["completed"] += 1
+        now_c, c0 = self._shots.counts(), s["shots0"]
+        s["shots0"] = now_c
         try:
             with open(s["log"], "a", newline="") as f:
                 csv.writer(f).writerow([
                     s["idx"] + 1, f"{s['delays'][s['idx']]:g}",
                     "" if s["actual"] is None else f"{s['actual']:g}", s["count"],
                     s["start_utc"], datetime.now(timezone.utc).isoformat(), status,
-                    os.path.basename(s["step_dir"])])
+                    os.path.basename(s["step_dir"]), now_c["missed"] - c0["missed"],
+                    now_c["dropped"] - c0["dropped"], now_c["incomplete"] - c0["incomplete"]])
         except OSError as e:
             print(f"scan_log.csv warning: {e}")
 
@@ -1218,12 +1491,13 @@ class MakoCameraGUI:
         # (free-run frames from before TriggerMode=On), so the first step of a timed scan
         # gets its full time too.
         measure_t0 = max(now + s["settle"], self._hw_arm_time + 0.5)
+        s["shots0"] = self._shots.counts()
         with self._scan_lock:
             s.update(idx=idx, count=0, actual=actual, step_dir=step_dir, png_dir=png_dir,
                      prefix=f"{self._run_name}_{name}", t0=now, measure_t0=measure_t0,
                      start_utc=datetime.now(timezone.utc).isoformat(), phase="measure")
 
-    def _scan_frame(self, img: np.ndarray, raw_frame):
+    def _scan_frame(self, img: np.ndarray, raw_frame, quality=None):
         """Frame handler thread: save the frame into the current step, if it counts."""
         s = self._scan
         if s is None:
@@ -1238,7 +1512,7 @@ class MakoCameraGUI:
                                                       s["prefix"], s["actual"])
         self._save_hardware_trigger_frame(
             img, raw_frame, folder=step_dir, png_dir=png_dir, delay_us=actual, prefix=prefix,
-            extra=dict(scan_step=idx + 1, scan_n_steps=s["n_steps"],
+            extra=dict(quality or {}, scan_step=idx + 1, scan_n_steps=s["n_steps"],
                        scan_delay_set_us=s["delays"][idx]))
 
     def _scan_poll(self):
@@ -1280,6 +1554,7 @@ class MakoCameraGUI:
         if status != "complete":
             self._scan_log_step(s, status)   # the interrupted step
         self._scan = None
+        self._end_run_info(status)
         try:
             with open(s["log"], "a") as f:
                 f.write(f"# {status}, {datetime.now(timezone.utc).isoformat()}, "
@@ -1411,6 +1686,12 @@ class MakoCameraGUI:
     def _update_stats(self):
         self.stat_triggers.config(text=f"Triggers received: {self.trigger_index}")
         self.stat_frames.config(text=f"Frames saved: {self.total_frames_saved}")
+        c = self._shots.counts()
+        bad = c["missed"] or c["dropped"] or c["incomplete"]
+        self.stat_shots.config(
+            text=f"Missed shots (est., hardware trigger): {c['missed']}  ·  dropped in "
+                 f"transfer: {c['dropped']}  ·  incomplete frames: {c['incomplete']}",
+            foreground="red" if bad else "")
 
     # --------------------------------------------------------------------------
     # Camera settings helpers

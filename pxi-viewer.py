@@ -10,6 +10,8 @@ ordered by natural sort of their names (numbers compared numerically). The frame
 is the first 2D dataset found in the file, or the dataset given with --key
 (e.g. --key entry/data/frame). All frames of a run must have the same shape.
 Directories whose name contains "dark" are offered as dark runs.
+A file may hold a burst of frames (e.g. frames/frame_0000, frame_0001, …): every 2D
+dataset of the same shape in the group of the first one is a frame.
 Several runs can be selected (Ctrl/Shift-click) and are then loaded together as
 one set of frames; each frame remembers which run it came from.
 
@@ -18,6 +20,10 @@ as displayed (dark subtracted, masked, binned); its position is the centre of it
 brightest binned pixel. Positions are given relative to a centre (typed, picked
 on the image or found automatically) in mm, using the detector diameter and the
 fitted active circle, and exported to HDF5 (see HITS_CONVENTION).
+
+Scan tab: mean total intensity (and hits) per frame against the trigger delay of the
+frames, for the selected runs, e.g. the steps of a delay scan made by the camera
+program (a folder with scan_log.csv and one subfolder per delay).
 Needs numpy, h5py, pyqtgraph (with PyQt5) and scipy.
 
 Keys:  Left/Right  prev/next pattern     PgUp/PgDn  jump 10
@@ -60,6 +66,7 @@ LIVE_STATS_MAX = 2000  # most recent frames kept in memory for the live mean/med
 HIST_CURRENT, HIST_ALL, HIST_SEL =("Current view", "All frames in run",
                                     "Stats selection (first N)")
 HIST_PIXELS, HIST_TOTALS = "Pixel values", "Total intensity per frame"
+SCAN_BY_DELAY, SCAN_BY_RUN = "trigger delay", "run"
 MASK_CONVENTION = "1 = masked (excluded) pixel, 0 = good pixel; native detector resolution"
 
 
@@ -304,24 +311,29 @@ def frame_dataset_name(h5, key=None):
     return found[0]
 
 
-def read_all_frames(path, key=None):
-    """All frames of one file as [(dataset name, 2D array, attrs)].
+def frame_names(h5, key=None):
+    """Frame datasets of one file, in natural order.
 
-    With `key` only that dataset; otherwise every 2D numeric dataset, so files
-    holding a burst of several frames (e.g. frames/frame_0000, frame_0001, …)
-    give one entry per frame.
+    With `key` only that dataset. Otherwise the first 2D numeric dataset and every
+    other 2D numeric dataset of the same shape in the same group, so a file holding a
+    burst of frames (frames/frame_0000, frame_0001, …) gives one entry per frame.
     """
+    if key:
+        return [key]
+    first = frame_dataset_name(h5)
+    ds0 = h5[first]
+    names = [o.name.lstrip("/") for o in ds0.parent.values()
+             if isinstance(o, h5py.Dataset) and o.ndim == 2 and o.dtype.kind in "uif"
+             and o.shape == ds0.shape]
+    return sorted(names, key=natural_key)
+
+
+def read_all_frames(path, key=None):
+    """All frames of one file as [(dataset name, 2D array, attrs)] (see frame_names)."""
     with h5py.File(path, "r") as h5:
-        if key:
-            names = [key]
-        else:
-            names = []
-            h5.visititems(lambda n, o: names.append(n) if isinstance(o, h5py.Dataset)
-                          and o.ndim == 2 and o.dtype.kind in "uif" else None)
-        if not names:
-            raise KeyError(f"no 2D dataset in {path}")
         # all attributes: the acquisition time (wall_time_utc_s) sorts late alphabetically
-        return [(n, h5[n][()], scalar_attrs(h5[n], limit=None)) for n in names]
+        return [(n, h5[n][()], scalar_attrs(h5[n], limit=None))
+                for n in frame_names(h5, key)]
 
 
 def scalar_attrs(ds, limit=12):
@@ -360,9 +372,12 @@ def load_mask(path):
 
 
 class Loader(QtCore.QThread):
-    """Reads all frames of one or more runs in the background (concatenated)."""
+    """Reads all frames of one or more runs in the background (concatenated).
+
+    Every frame of every file is loaded, also bursts of several frames per file;
+    done() gives per frame: source file, dataset name, attributes and run index."""
     progress = QtCore.pyqtSignal(int, int)
-    done = QtCore.pyqtSignal(object, object, object, object)
+    done = QtCore.pyqtSignal(object, object, object, object, object)
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, run_dirs):
@@ -371,26 +386,40 @@ class Loader(QtCore.QThread):
 
     def run(self):
         try:
-            files, run_of = [], []
+            files, run_of_file = [], []
             for r, d in enumerate(self.run_dirs):
                 fs = list_frames(d)
                 files += fs
-                run_of += [r] * len(fs)
-            frames, meta, key = None, [], FRAME_KEY
+                run_of_file += [r] * len(fs)
+            frames, n = None, 0
+            src, names, meta, run_of = [], [], [], []
             for i, f in enumerate(files):
                 with h5py.File(f, "r") as h5:
-                    key = frame_dataset_name(h5, key)  # detected once, then reused
-                    ds = h5[key]
-                    if frames is None:
-                        frames = np.empty((len(files),) + ds.shape, dtype=ds.dtype)
-                    elif ds.shape != frames.shape[1:]:
-                        raise ValueError(f"{os.path.basename(f)}: frame shape {ds.shape} "
-                                         f"differs from {frames.shape[1:]}")
-                    frames[i] = ds[()]
-                    meta.append(scalar_attrs(ds))
+                    for name in frame_names(h5, FRAME_KEY):
+                        ds = h5[name]
+                        if frames is None:  # room for as many frames per file as the first
+                            per_file = max(len(frame_names(h5, FRAME_KEY)), 1)
+                            frames = np.empty((len(files) * per_file,) + ds.shape, ds.dtype)
+                        elif ds.shape != frames.shape[1:]:
+                            raise ValueError(f"{os.path.basename(f)} {name}: frame shape "
+                                             f"{ds.shape} differs from {frames.shape[1:]}")
+                        if n == len(frames):  # more frames than expected: grow
+                            extra = max(len(files) - i, 1) * 2
+                            frames = np.concatenate(
+                                [frames, np.empty((extra,) + frames.shape[1:], frames.dtype)])
+                        frames[n] = ds[()]
+                        n += 1
+                        src.append(f)
+                        names.append(name)
+                        meta.append(scalar_attrs(ds, limit=None))
+                        run_of.append(run_of_file[i])
                 if i % 25 == 0:
                     self.progress.emit(i, len(files))
-            self.done.emit(frames, files, meta, np.array(run_of, dtype=int))
+            if frames is None:
+                raise ValueError("no frames found")
+            frames = frames[:n] if n == len(frames) or n > 0.9 * len(frames) \
+                else frames[:n].copy()  # give back unused memory
+            self.done.emit(frames, src, names, meta, np.array(run_of, dtype=int))
         except Exception as e:  # surface I/O errors in the GUI
             self.failed.emit(repr(e))
 
@@ -716,8 +745,12 @@ class PatternViewer(QtWidgets.QMainWindow):
             self.runs.update(find_runs(r))
 
         self.frames = None      # (N, H, W) raw uint8
-        self.files = []
+        self.files = []         # source file of every frame
+        self.frame_ds = []      # dataset name of every frame inside its file
+        self._burst_files = set()  # files holding more than one frame
         self.meta = []
+        self.scans = {}         # delay scan name -> its step runs (folders with scan_log.csv)
+        self.scan_res = None    # results of the Scan tab
         self.dark_cache = {}    # run name -> mean dark frame (float32)
         self.stat_cache = {}    # (view, n) -> image
         self.raw_totals = None  # plain sum of each frame
@@ -806,6 +839,7 @@ class PatternViewer(QtWidgets.QMainWindow):
         self.tabs.addTab(self._build_hist_tab(), "Histograms")
         self.tabs.addTab(self._build_hits_tab(), "Hits")
         self.tabs.addTab(self._build_live_tab(), "Live")
+        self.tabs.addTab(self._build_scan_tab(), "Scan")
         self.tabs.currentChanged.connect(lambda _: self._update_hist())
 
         # ---- control panel
@@ -1248,6 +1282,7 @@ class PatternViewer(QtWidgets.QMainWindow):
 
     def _fill_run_combos(self):
         names = sorted(self.runs)
+        self._find_scans()
         self._n_files = {n: len(list_frames(self.runs[n])) for n in names}
         keep = set(self.selected_runs())
         self.run_list.blockSignals(True)
@@ -1327,7 +1362,7 @@ class PatternViewer(QtWidgets.QMainWindow):
         self.loader = Loader([self.runs[n] for n in names])
         self.loader.progress.connect(lambda i, n: (self.progress.setMaximum(n),
                                                    self.progress.setValue(i)))
-        self.loader.done.connect(lambda fr, fi, me, ro: self._loaded(names, fr, fi, me, ro))
+        self.loader.done.connect(lambda fr, fi, ds, me, ro: self._loaded(names, fr, fi, ds, me, ro))
         self.loader.failed.connect(self._load_failed)
         self.loader.start()
 
@@ -1336,10 +1371,14 @@ class PatternViewer(QtWidgets.QMainWindow):
         self.progress.setVisible(False)
         QtWidgets.QMessageBox.critical(self, "Load failed", msg)
 
-    def _loaded(self, names, frames, files, meta, run_of):
+    def _loaded(self, names, frames, files, frame_ds, meta, run_of):
         self.load_btn.setEnabled(True)
         self.progress.setVisible(False)
-        self.frames, self.files, self.meta = frames, files, meta
+        self.frames, self.files, self.frame_ds, self.meta = frames, files, frame_ds, meta
+        counts = {}
+        for f in files:
+            counts[f] = counts.get(f, 0) + 1
+        self._burst_files = {f for f, c in counts.items() if c > 1}
         self.loaded_runs, self.run_of = names, run_of
         # short label for titles/histograms, e.g. "run_a" or "run_a + 2 more"
         name = names[0] if len(names) == 1 else f"{names[0]} + {len(names) - 1} more"
@@ -1378,14 +1417,14 @@ class PatternViewer(QtWidgets.QMainWindow):
             self.status.showMessage(f"Computing mean dark from {name} …")
             QtWidgets.QApplication.processEvents()
             try:
-                files = list_frames(self.runs[name])
-                acc, key = None, FRAME_KEY
-                for f in files:
+                acc, n = None, 0
+                for f in list_frames(self.runs[name]):
                     with h5py.File(f, "r") as h5:
-                        key = frame_dataset_name(h5, key)
-                        fr = h5[key][()].astype(np.float64)
-                    acc = fr if acc is None else acc + fr
-                self.dark_cache[name] = (acc / len(files)).astype(np.float32)
+                        for key in frame_names(h5, FRAME_KEY):
+                            fr = h5[key][()].astype(np.float64)
+                            acc = fr if acc is None else acc + fr
+                            n += 1
+                self.dark_cache[name] = (acc / n).astype(np.float32)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
         return self.dark_cache[name]
@@ -1615,6 +1654,8 @@ class PatternViewer(QtWidgets.QMainWindow):
             i = self.current_index()
             m = self.meta[i]
             text = (f"<b>{os.path.basename(self.files[i])}</b><br>"
+                    + (f"dataset {self.frame_ds[i]}<br>" if self.files[i] in self._burst_files
+                       else "") +
                     f"frame #{i}<br>"
                     f"position {pos + 1}/{len(self.order)}<br>"
                     f"total intensity: {self.totals[i]:.4g}<br>"
@@ -2331,7 +2372,8 @@ class PatternViewer(QtWidgets.QMainWindow):
                          dark=self.dark_combo.currentText() if dark is not None else "",
                          n_masked=int(mask.sum()) if mask is not None else 0,
                          mask=None if mask is None else mask.copy(),
-                         files=list(self.files), runs=list(self.loaded_runs),
+                         files=list(self.files), frame_ds=list(self.frame_ds),
+                         runs=list(self.loaded_runs), meta=self.meta,
                          run_of=self.run_of.copy(), settings=self._hit_settings())
         counts = np.array([len(x) for x in res["ix"]])
         self.hpf_curve.setData(np.arange(n), counts)
@@ -2466,6 +2508,8 @@ class PatternViewer(QtWidgets.QMainWindow):
                 f.create_dataset(f"hit_{key}", data=extra[key], compression="gzip").attrs[
                     "description"] = desc
             f.create_dataset("files", data=np.array(h["files"], dtype=object), dtype=str_dt)
+            f.create_dataset("frame_dataset", data=np.array(h["frame_ds"], dtype=object),
+                             dtype=str_dt).attrs["description"] = "dataset of each frame in its file"
             f.create_dataset("run_index", data=h["run_of"])
             f.create_dataset("runs", data=np.array(h["runs"], dtype=object), dtype=str_dt)
             if h["mask"] is not None:
@@ -2479,6 +2523,261 @@ class PatternViewer(QtWidgets.QMainWindow):
                 min_size=h["min_size"], n_masked_px=h["n_masked"], dark_run=h["dark"]))
             if self.circle is not None:
                 f.attrs["detector_circle_px"] = np.asarray(self.circle, dtype=float)
+            # flight distance from the frames' setup notes (camera program), if recorded
+            L = np.array([m.get("setup_flight_distance_mm", np.nan) for m in h["meta"]],
+                         dtype=float)
+            if np.isfinite(L).any():
+                vals = np.unique(L[np.isfinite(L)])
+                f.attrs["flight_distance_mm"] = vals[0] if len(vals) == 1 else np.nan
+                if len(vals) > 1:
+                    f.attrs["flight_distance_mm_values"] = vals
+                    f.create_dataset("flight_distance_mm", data=L).attrs["description"] = \
+                        "flight distance of each frame (setup notes); NaN = not recorded"
+
+    # ---------------------------------------------------------------- delay scan
+    def _build_scan_tab(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout()
+        self.scan_combo = QtWidgets.QComboBox()
+        self.scan_combo.setToolTip("Delay scans among the runs: folders holding scan_log.csv, "
+                                   "whose subfolders (one per delay) are runs")
+        self.scan_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        sel = QtWidgets.QPushButton("Select its steps")
+        sel.setToolTip("Select the step runs of this scan in the run list")
+        sel.clicked.connect(self._select_scan_steps)
+        self.scan_group = QtWidgets.QComboBox()
+        self.scan_group.addItems([SCAN_BY_DELAY, SCAN_BY_RUN])
+        self.scan_group.setToolTip("trigger delay: one point per value of the frames' "
+                                   "trigger_delay_us attribute (frames without it are grouped "
+                                   "by run); run: one point per run")
+        self.scan_hits_chk = QtWidgets.QCheckBox("count hits")
+        self.scan_hits_chk.setToolTip("Also count hits per frame with the Hits tab's threshold "
+                                      "and min size, the current binning, mask and dark")
+        comp = QtWidgets.QPushButton("Compute from selected runs")
+        comp.setToolTip("Reads every frame of the runs selected in the run list (they are not "
+                        "loaded into the viewer). Dark and mask as in the side panel.")
+        comp.clicked.connect(self.compute_scan)
+        exp = QtWidgets.QPushButton("Export CSV…")
+        exp.clicked.connect(self._export_scan)
+        for wd in (QtWidgets.QLabel("Scan"), self.scan_combo, sel, QtWidgets.QLabel("  group by"),
+                   self.scan_group, self.scan_hits_chk, comp, exp):
+            top.addWidget(wd)
+        top.addStretch(1)
+        v.addLayout(top)
+
+        plots = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.scan_plots = {}
+        for key, ylabel in (("int", "Mean total intensity per frame"),
+                            ("hits", "Hits per frame")):
+            pw = pg.PlotWidget()
+            pw.setLabel("left", ylabel)
+            pw.setLabel("bottom", "Trigger delay (µs)")
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            line = pw.plot(pen=pg.mkPen((100, 160, 255), width=1))
+            err = pg.ErrorBarItem(x=np.zeros(0), y=np.zeros(0), beam=0,
+                                  pen=pg.mkPen((100, 160, 255), width=1))
+            pw.addItem(err)
+            pts = pg.ScatterPlotItem(size=9, brush=pg.mkBrush(255, 170, 0),
+                                     pen=pg.mkPen((40, 40, 40)), hoverable=True)
+            pts.sigClicked.connect(self._scan_point_clicked)
+            pw.addItem(pts)
+            plots.addWidget(pw)
+            self.scan_plots[key] = (pw, line, err, pts)
+        self.scan_plots["hits"][0].setXLink(self.scan_plots["int"][0])
+        self.scan_table = QtWidgets.QTableWidget()
+        self.scan_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.scan_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.scan_table.cellDoubleClicked.connect(lambda r, _: self._load_scan_group(r))
+        plots.addWidget(self.scan_table)
+        plots.setStretchFactor(0, 3)
+        plots.setStretchFactor(1, 2)
+        plots.setStretchFactor(2, 2)
+        v.addWidget(plots, 1)
+        self.scan_info = QtWidgets.QLabel(
+            "Select runs (or a scan above), then press Compute. Error bars: ± standard error "
+            "of the mean. Click a point or double-click a row to load those frames.")
+        self.scan_info.setWordWrap(True)
+        v.addWidget(self.scan_info)
+        return w
+
+    def _find_scans(self):
+        """Delay scans: folders with scan_log.csv whose subfolders are runs."""
+        scans = {}
+        for name, path in self.runs.items():
+            parent = os.path.dirname(path)
+            if os.path.isfile(os.path.join(parent, "scan_log.csv")):
+                scans.setdefault(os.path.dirname(name) or name, []).append(name)
+        self.scans = {k: sorted(v, key=natural_key) for k, v in scans.items()}
+        if hasattr(self, "scan_combo"):
+            cur = self.scan_combo.currentData()
+            self.scan_combo.clear()
+            for k in sorted(self.scans, key=natural_key):
+                self.scan_combo.addItem(f"{k}  ({len(self.scans[k])} steps)", k)
+            if cur in self.scans:
+                self.scan_combo.setCurrentIndex(self.scan_combo.findData(cur))
+
+    def _select_scan_steps(self):
+        k = self.scan_combo.currentData()
+        if k in self.scans:
+            self.select_runs(self.scans[k])
+
+    def compute_scan(self):
+        """Mean total intensity (and hits) per frame for every delay of the selected runs."""
+        names = self.selected_runs()
+        if not names:
+            self.status.showMessage("Select the runs of the scan first (e.g. 'Select its steps')")
+            return
+        by_delay = self.scan_group.currentText() == SCAN_BY_DELAY
+        count_hits = self.scan_hits_chk.isChecked()
+        dark, mask = self._dark(), self._active_mask()
+        thr, min_size = self.hit_thr.value(), self.hit_min.value()
+        files = [(name, f) for name in names for f in list_frames(self.runs[name])]
+        groups = {}
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for i, (name, path) in enumerate(files):
+                if i % 20 == 0:
+                    self._hist_progress(i, len(files))
+                with h5py.File(path, "r") as h5:
+                    for dn in frame_names(h5, FRAME_KEY):
+                        ds = h5[dn]
+                        img = ds[()].astype(np.float32)
+                        for what, arr in (("dark", dark), ("mask", mask)):
+                            if arr is not None and arr.shape != img.shape:
+                                raise ValueError(f"{what} shape {arr.shape} differs from the "
+                                                 f"frames {img.shape} of {name}")
+                        if dark is not None:
+                            img -= dark
+                        total = float(img[~mask].sum()) if mask is not None else float(img.sum())
+                        delay = ds.attrs.get("trigger_delay_us")
+                        key = round(float(delay), 6) if by_delay and delay is not None \
+                            else name
+                        g = groups.setdefault(key, dict(key=key, runs=[], totals=[], hits=[],
+                                                        missed=0, incomplete=0))
+                        if name not in g["runs"]:
+                            g["runs"].append(name)
+                        g["totals"].append(total)
+                        if count_hits:
+                            g["hits"].append(len(find_hits(self._display(img, use_log=False),
+                                                           thr, min_size)["ix"]))
+                        g["missed"] += int(ds.attrs.get("missed_before", 0))
+                        g["incomplete"] += int(ds.attrs.get("frame_complete", 1) == 0)
+        except (OSError, KeyError, ValueError) as e:
+            QtWidgets.QMessageBox.warning(self, "Scan", str(e))
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.progress.setVisible(False)
+
+        numeric = bool(groups) and all(not isinstance(k, str) for k in groups)
+        order = sorted(groups, key=float) if numeric else list(groups)
+        res = []
+        for x, k in enumerate(order):
+            g = groups[k]
+            t = np.asarray(g["totals"])
+            hits = np.asarray(g["hits"], dtype=float)
+            sem = lambda a: a.std(ddof=1) / np.sqrt(len(a)) if len(a) > 1 else np.nan
+            res.append(dict(
+                x=float(k) if numeric else float(x), label=f"{k:g}" if numeric else str(k),
+                runs=g["runs"], frames=len(t), mean=t.mean(), sem=sem(t),
+                hits=hits.mean() if hits.size else np.nan, hits_sem=sem(hits),
+                hit_frac=(hits > 0).mean() if hits.size else np.nan,
+                missed=g["missed"], incomplete=g["incomplete"]))
+        self.scan_res = dict(rows=res, numeric=numeric, hits=count_hits,
+                             dark=self.dark_combo.currentText() if dark is not None else "",
+                             n_masked=int(mask.sum()) if mask is not None else 0,
+                             bin=self._bin, bin_mode=self._bin_mode(), threshold=thr,
+                             min_size=min_size, runs=list(names))
+        self._show_scan()
+
+    def _show_scan(self):
+        r = self.scan_res
+        rows = r["rows"]
+        x = np.array([d["x"] for d in rows])
+        xlabel = "Trigger delay (µs)" if r["numeric"] else "Run (see table)"
+        for key, (ycol, ecol) in (("int", ("mean", "sem")), ("hits", ("hits", "hits_sem"))):
+            pw, line, err, pts = self.scan_plots[key]
+            pw.setLabel("bottom", xlabel)
+            y = np.array([d[ycol] for d in rows], dtype=float)
+            e = np.nan_to_num(np.array([d[ecol] for d in rows], dtype=float))
+            if key == "hits" and not r["hits"]:
+                y = np.full(len(rows), np.nan)
+            ok = np.isfinite(y)
+            line.setData(x[ok], y[ok])
+            err.setData(x=x[ok], y=y[ok], top=e[ok], bottom=e[ok])
+            pts.setData(x=x[ok], y=y[ok], data=np.flatnonzero(ok))
+        if not r["numeric"]:
+            ticks = [(d["x"], d["label"]) for d in rows]
+            for key in ("int", "hits"):
+                self.scan_plots[key][0].getAxis("bottom").setTicks([ticks])
+        else:
+            for key in ("int", "hits"):
+                self.scan_plots[key][0].getAxis("bottom").setTicks(None)
+        cols = ["delay (µs)" if r["numeric"] else "group", "frames", "mean total / frame",
+                "SEM", "hits / frame", "SEM", "frames with hits", "missed shots (est.)",
+                "incomplete", "runs"]
+        self.scan_table.setColumnCount(len(cols))
+        self.scan_table.setHorizontalHeaderLabels(cols)
+        self.scan_table.setRowCount(len(rows))
+        for i, d in enumerate(rows):
+            vals = [d["label"], str(d["frames"]), f"{d['mean']:.6g}", f"{d['sem']:.3g}",
+                    f"{d['hits']:.4g}", f"{d['hits_sem']:.3g}",
+                    "" if not np.isfinite(d["hit_frac"]) else f"{100 * d['hit_frac']:.1f} %",
+                    str(d["missed"]), str(d["incomplete"]), ", ".join(d["runs"])]
+            for j, val in enumerate(vals):
+                self.scan_table.setItem(i, j, QtWidgets.QTableWidgetItem(
+                    "" if val == "nan" else val))
+        self.scan_table.resizeColumnsToContents()
+        n = sum(d["frames"] for d in rows)
+        best = max(rows, key=lambda d: d["mean"]) if rows else None
+        self.scan_info.setText(
+            f"{len(rows)} points from {n} frames of {len(r['runs'])} run(s)"
+            + (f"; highest mean intensity at {best['label']}" + (" µs" if r["numeric"] else "")
+               if best else "")
+            + (f"; dark: {r['dark']}" if r["dark"] else "")
+            + f"; {r['n_masked']} px masked"
+            + (f"; hits: bin ×{r['bin']} {r['bin_mode']}, threshold ≥ {r['threshold']:g}, "
+               f"min size {r['min_size']}" if r["hits"] else "")
+            + ". Click a point or double-click a row to load those frames.")
+
+    def _scan_point_clicked(self, item, points, ev=None):
+        if len(points):
+            self._load_scan_group(int(points[0].data()))
+
+    def _load_scan_group(self, row):
+        if self.scan_res is None or not 0 <= row < len(self.scan_res["rows"]):
+            return
+        self.select_runs(self.scan_res["rows"][row]["runs"])
+        self.load_run()
+        self.tabs.setCurrentIndex(0)
+
+    def _export_scan(self):
+        if self.scan_res is None:
+            self.status.showMessage("Compute the scan first")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export scan", "scan.csv",
+                                                        "CSV (*.csv)")
+        if path:
+            self.export_scan(path if path.endswith(".csv") else path + ".csv")
+            self.status.showMessage(f"Exported scan to {path}")
+
+    def export_scan(self, path):
+        import csv
+        r = self.scan_res
+        with open(path, "w", newline="") as f:
+            f.write(f"# PXI-viewer scan: runs {', '.join(r['runs'])}; dark: {r['dark'] or 'none'}; "
+                    f"{r['n_masked']} px masked" + (f"; hits: bin x{r['bin']} {r['bin_mode']}, "
+                    f"threshold >= {r['threshold']:g}, min size {r['min_size']}" if r["hits"]
+                    else "") + "\n")
+            wr = csv.writer(f)
+            wr.writerow(["delay_us" if r["numeric"] else "group", "frames", "mean_total",
+                         "sem_total", "hits_per_frame", "sem_hits", "frac_frames_with_hits",
+                         "missed_shots_est", "incomplete_frames", "runs"])
+            for d in r["rows"]:
+                wr.writerow([d["label"], d["frames"], f"{d['mean']:.8g}", f"{d['sem']:.6g}",
+                             f"{d['hits']:.6g}", f"{d['hits_sem']:.6g}", f"{d['hit_frac']:.6g}",
+                             d["missed"], d["incomplete"], ";".join(d["runs"])])
 
     # ---------------------------------------------------------------- live
     def _build_live_tab(self):

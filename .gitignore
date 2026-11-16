@@ -9,3 +9,4 @@ data_camera/
 .venv/
 __pycache__/
 *.part
+mako_setup.json
