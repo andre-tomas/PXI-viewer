@@ -236,11 +236,14 @@ view, matplotlib for `--plot`.
 - **L** comes from the export (`flight_distance_mm`, i.e. the camera program's Setup
   Notes) or `--L`. If frames of different distances were exported together, it stops and
   asks for one distance at a time.
-- **Handedness:** whether the camera sees the phosphor from the front, from behind or via
-  a mirror flips the image. Without `--mirror`, the image is taken as seen from the detector
-  looking towards the interaction point. Directions and orientation retrieval do not
-  depend on it, but the chirality of a reconstructed shape does: check it once with an
-  asymmetric object of known orientation in front of the detector (e.g. the mesh).
+- **Handedness:** without `--mirror` (the default) the image is taken as seen from behind
+  the detector, looking back towards the interaction point. That is the PXI setup: the
+  camera is outside the chamber, views the back of the phosphor screen through the
+  window, and has no mirror in its path. The directions then have the same handedness as
+  the simulated detector in `explode_tools`. Use `--mirror` only if the optics change: an
+  odd number of mirrors in the path, the camera's `ReverseX` or `ReverseY` switched on,
+  or a view of the ion-facing side of the screen. Orientations don't depend on this, but
+  the chirality of a reconstructed shape does.
 - **Field of view:** the directions the hit finder could report. A direction counts if it
   lands in a bin the viewer used (masked fraction below *Hide bin at*, full bins only) with
   its centre inside the active circle. It is saved as a native-pixel mask (`fov/mask`) and

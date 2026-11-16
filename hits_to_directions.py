@@ -16,12 +16,14 @@ in the lab frame used by OREO and explode_tools: +x is the detector normal point
 the interaction point to the detector, and a hit lands at (L, L·u_y/u_x, L·u_z/u_x), as in
 explode_tools.invert_H_to_r. z is "up" in the image.
 
-Handedness. Whether the camera looks at the phosphor from the front, from behind or via a
-mirror flips the image. Without --mirror the image is taken as seen looking from the
-detector towards the interaction point. Directions, orientation retrieval and rotation
-invariants do not depend on this, but the handedness (chirality) of a reconstructed shape
-does: check it once with an asymmetric object of known orientation in front of the
-detector (e.g. a mesh or a marker) before reading chirality from the data.
+Handedness. Without --mirror the image is taken as seen from behind the detector,
+looking back towards the interaction point. That is the PXI setup: the camera sits
+outside the chamber, views the back of the phosphor screen through the window, and the
+optical path has no mirror (2026-11). The mapping is then a proper rotation of the lab
+frame, with the same handedness as the simulated detector in explode_tools. Use --mirror
+only if the optics change: a mirror in the path (an odd number of them), the camera's
+ReverseX or ReverseY switched on, or a view of the ion-facing side of the screen.
+Orientations do not depend on this, but the chirality of a reconstructed shape does.
 
 Field of view. The detectable directions are those the hit finder could report: a hit is
 the centre of a binned pixel, so a direction counts if it lands in a bin that the viewer
